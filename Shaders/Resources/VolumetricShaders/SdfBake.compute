@@ -1,0 +1,136 @@
+// ============================================================================
+// SdfBake.compute
+// Bakes signed distance field from primitives and/or mesh triangles.
+// Output: raw world-space distance in meters (RHalf / R16_SFloat).
+// Supports rotated volumes via matrix transforms.
+// ============================================================================
+
+#pragma kernel CSBakeSdf
+#pragma kernel CSBakeMeshSdf
+#pragma kernel CSCompositePrimitives
+
+#include "Includes/VolumetricsCommon.hlsl"
+
+// ============================================================================
+// DATA STRUCTURES (must match C# SdfShapeGpu / SdfTriangleGpu)
+// ============================================================================
+
+struct SdfShape {
+    float3 position;       // 12
+    float cornerRadius;    // 4
+    float4 rotationQuat;   // 16
+    float3 halfExtents;    // 12
+    float smoothing;       // 4
+    int opType;            // 4
+    float _pad0, _pad1, _pad2; // 12 = 64 total
+};
+
+struct MeshTriangle {
+    float3 v0, v1, v2;    // 36
+    float smoothing;       // 4
+    int opType;            // 4
+    float _pad0, _pad1, _pad2; // 12 = 56 total
+};
+
+// ============================================================================
+// BUFFERS
+// ============================================================================
+
+StructuredBuffer<SdfShape> _ZoneBuffer;
+int _ZoneCount;
+
+StructuredBuffer<MeshTriangle> _TriangleBuffer;
+int _TriangleCount;
+
+RWTexture3D<float> _OutputSdf;
+
+// ============================================================================
+// TRIANGLE SDF
+// ============================================================================
+
+float sdTriangle(float3 p, float3 a, float3 b, float3 c) {
+    float3 ba = b - a; float3 pa = p - a;
+    float3 cb = c - b; float3 pb = p - b;
+    float3 ac = a - c; float3 pc = p - c;
+    float3 nor = cross(ba, ac);
+
+    float signDot = sign(dot(cross(ba, nor), pa)) +
+                    sign(dot(cross(cb, nor), pb)) +
+                    sign(dot(cross(ac, nor), pc));
+
+    if (signDot < 2.0) {
+        float3 e1 = ba * clamp(dot(ba, pa) / dot(ba, ba), 0.0, 1.0) - pa;
+        float3 e2 = cb * clamp(dot(cb, pb) / dot(cb, cb), 0.0, 1.0) - pb;
+        float3 e3 = ac * clamp(dot(ac, pc) / dot(ac, ac), 0.0, 1.0) - pc;
+        return sqrt(min(min(dot(e1, e1), dot(e2, e2)), dot(e3, e3)));
+    }
+    return abs(dot(nor, pa)) / length(nor);
+}
+
+float sdMesh(float3 p, int triCount) {
+    float minDist = MAX_DISTANCE;
+    int crossings = 0;
+    float3 rayDir = float3(0, 1, 0);
+
+    for (int i = 0; i < triCount; i++) {
+        MeshTriangle tri = _TriangleBuffer[i];
+        minDist = min(minDist, sdTriangle(p, tri.v0, tri.v1, tri.v2));
+
+        float3 e1 = tri.v1 - tri.v0;
+        float3 e2 = tri.v2 - tri.v0;
+        float3 h = cross(rayDir, e2);
+        float a = dot(e1, h);
+
+        if (abs(a) > 0.0001) {
+            float f = 1.0 / a;
+            float3 s = p - tri.v0;
+            float u = f * dot(s, h);
+            if (u >= 0.0 && u <= 1.0) {
+                float3 q = cross(s, e1);
+                float v = f * dot(rayDir, q);
+                if (v >= 0.0 && u + v <= 1.0) {
+                    if (f * dot(e2, q) > 0.0001)
+                        crossings++;
+                }
+            }
+        }
+    }
+
+    return (crossings & 1) ? -minDist : minDist;
+}
+
+// ============================================================================
+// SHARED
+// ============================================================================
+
+float EvaluatePrimitives(float3 worldPos, float sceneDist) {
+    for (int i = 0; i < _ZoneCount; i++) {
+        SdfShape zone = _ZoneBuffer[i];
+        float3 localPos = InverseRotateByQuat(worldPos - zone.position, zone.rotationQuat);
+        float d = sdRoundedBox(localPos, zone.halfExtents, zone.cornerRadius);
+        sceneDist = CombineSdf(sceneDist, d, (uint)zone.opType, zone.smoothing);
+    }
+    return sceneDist;
+}
+
+// ============================================================================
+// KERNELS
+// ============================================================================
+
+[numthreads(4, 4, 4)]
+void CSBakeSdf(uint3 id : SV_DispatchThreadID) {
+    if (any(id >= uint3(_Resolution))) return;
+    _OutputSdf[id] = EvaluatePrimitives(VoxelToWorld(id), MAX_DISTANCE);
+}
+
+[numthreads(4, 4, 4)]
+void CSBakeMeshSdf(uint3 id : SV_DispatchThreadID) {
+    if (any(id >= uint3(_Resolution))) return;
+    _OutputSdf[id] = sdMesh(VoxelToWorld(id), _TriangleCount);
+}
+
+[numthreads(4, 4, 4)]
+void CSCompositePrimitives(uint3 id : SV_DispatchThreadID) {
+    if (any(id >= uint3(_Resolution))) return;
+    _OutputSdf[id] = EvaluatePrimitives(VoxelToWorld(id), _OutputSdf[id]);
+}

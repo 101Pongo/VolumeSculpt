@@ -1,0 +1,69 @@
+// ============================================================================
+// Paint3DBake.compute
+// Bakes paint zones into RWTexture3D<float4> using rounded box SDF.
+// Supports rotated volumes via matrix transforms.
+// ============================================================================
+
+#pragma kernel CSBakePaint
+
+#include "Includes/VolumetricsCommon.hlsl"
+
+// ============================================================================
+// DATA STRUCTURES (must match C# PaintZoneGpu)
+// ============================================================================
+
+struct PaintZone {
+    float3 position;       // 12
+    float cornerRadius;    // 4
+    float4 rotationQuat;   // 16
+    float3 halfExtents;    // 12
+    float falloff;         // 4
+    float4 value;          // 16
+    int writeMask;         // 4
+    int blendMode;         // 4
+    float _pad0, _pad1;    // 8 = 80 total
+};
+
+// ============================================================================
+// BUFFERS
+// ============================================================================
+
+StructuredBuffer<PaintZone> _ZoneBuffer;
+int _ZoneCount;
+
+RWTexture3D<float4> _OutputPaint;
+float4 _DefaultValue;
+
+// ============================================================================
+// KERNEL
+// ============================================================================
+
+[numthreads(4, 4, 4)]
+void CSBakePaint(uint3 id : SV_DispatchThreadID) {
+    if (any(id >= uint3(_Resolution))) return;
+
+    float3 worldPos = VoxelToWorld(id);
+    float4 result = _DefaultValue;
+
+    for (int i = 0; i < _ZoneCount; i++) {
+        PaintZone zone = _ZoneBuffer[i];
+        float3 localPos = InverseRotateByQuat(worldPos - zone.position, zone.rotationQuat);
+        float d = sdRoundedBox(localPos, zone.halfExtents, zone.cornerRadius);
+        float influence = GetInfluence(d, zone.falloff);
+        if (influence <= 0.0) continue;
+
+        if (zone.blendMode == 0) {
+            if (zone.writeMask & 1) result.x = lerp(result.x, zone.value.x, influence);
+            if (zone.writeMask & 2) result.y = lerp(result.y, zone.value.y, influence);
+            if (zone.writeMask & 4) result.z = lerp(result.z, zone.value.z, influence);
+            if (zone.writeMask & 8) result.w = lerp(result.w, zone.value.w, influence);
+        } else {
+            if (zone.writeMask & 1) result.x += zone.value.x * influence;
+            if (zone.writeMask & 2) result.y += zone.value.y * influence;
+            if (zone.writeMask & 4) result.z += zone.value.z * influence;
+            if (zone.writeMask & 8) result.w += zone.value.w * influence;
+        }
+    }
+
+    _OutputPaint[id] = result;
+}
